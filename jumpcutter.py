@@ -11,10 +11,14 @@ from shutil import copyfile, rmtree
 import os
 import argparse
 from pytube import YouTube
+import datetime
 
 def downloadFile(url):
-    name = YouTube(url).streams.first().download()
-    newname = name.replace(' ','_')
+    callback = lambda stream, chunk, bytes_remaining: print(f'\rDownloading video: {round((1 - bytes_remaining / stream.filesize) * 100)}%', end='')
+    streams = YouTube(url, on_progress_callback=callback).streams
+    selected_stream = streams.get_by_resolution('720p') or streams.get_by_resolution('1080p') or streams.get_highest_resolution()
+    name = selected_stream.download()
+    newname = os.path.join(os.path.dirname(name), os.path.basename(name).replace(' ', '_'))
     os.rename(name,newname)
     return newname
 
@@ -29,8 +33,6 @@ def copyFrame(inputFrame,outputFrame):
     if not os.path.isfile(src):
         return False
     copyfile(src, dst)
-    if outputFrame%20 == 19:
-        print(str(outputFrame+1)+" time-altered frames saved.")
     return True
 
 def inputToOutputFilename(filename):
@@ -43,7 +45,8 @@ def createPath(s):
     try:  
         os.mkdir(s)
     except OSError:  
-        assert False, "Creation of the directory %s failed. (The TEMP folder may already exist. Delete or rename it, and try again.)"
+        #assert False, "Creation of the directory %s failed. (The TEMP folder may already exist. Delete or rename it, and try again.)"
+        pass
 
 def deletePath(s): # Dangerous! Watch out!
     try:  
@@ -92,14 +95,16 @@ AUDIO_FADE_ENVELOPE_SIZE = 400 # smooth out transitiion's audio by quickly fadin
     
 createPath(TEMP_FOLDER)
 
-command = "ffmpeg -i "+INPUT_FILE+" -qscale:v "+str(FRAME_QUALITY)+" "+TEMP_FOLDER+"/frame%06d.jpg -hide_banner"
+command = "ffmpeg -i \""+INPUT_FILE+"\" -qscale:v "+str(FRAME_QUALITY)+" "+TEMP_FOLDER+"/frame%06d.jpg -hide_banner"
+print('command: ' + command)
 subprocess.call(command, shell=True)
 
-command = "ffmpeg -i "+INPUT_FILE+" -ab 160k -ac 2 -ar "+str(SAMPLE_RATE)+" -vn "+TEMP_FOLDER+"/audio.wav"
-
+command = "ffmpeg -i \""+INPUT_FILE+"\" -ab 160k -ac 2 -ar "+str(SAMPLE_RATE)+" -vn "+TEMP_FOLDER+"/audio.wav"
+print('command: ' + command)
 subprocess.call(command, shell=True)
 
-command = "ffmpeg -i "+TEMP_FOLDER+"/input.mp4 2>&1"
+command = "ffmpeg -i \""+ INPUT_FILE +"\" 2>&1"
+print('command: ' + command)
 f = open(TEMP_FOLDER+"/params.txt", "w")
 subprocess.call(command, shell=True, stdout=f)
 
@@ -139,43 +144,52 @@ shouldIncludeFrame = np.zeros((audioFrameCount))
 for i in range(audioFrameCount):
     start = int(max(0,i-FRAME_SPREADAGE))
     end = int(min(audioFrameCount,i+1+FRAME_SPREADAGE))
-    shouldIncludeFrame[i] = np.max(hasLoudAudio[start:end])
+    shouldIncludeFrame[i] = 1 if np.any(hasLoudAudio[start:end]) else 0
     if (i >= 1 and shouldIncludeFrame[i] != shouldIncludeFrame[i-1]): # Did we flip?
         chunks.append([chunks[-1][1],i,shouldIncludeFrame[i-1]])
 
 chunks.append([chunks[-1][1],audioFrameCount,shouldIncludeFrame[i-1]])
 chunks = chunks[1:]
 
-outputAudioData = np.zeros((0,audioData.shape[1]))
 outputPointer = 0
 
+print('copying frames')
 lastExistingFrame = None
-for chunk in chunks:
+timestamp = datetime.datetime.now()
+last_sample = 0
+audio_chunks = []
+for i, chunk in enumerate(chunks):
     audioChunk = audioData[int(chunk[0]*samplesPerFrame):int(chunk[1]*samplesPerFrame)]
     
-    sFile = TEMP_FOLDER+"/tempStart.wav"
-    eFile = TEMP_FOLDER+"/tempEnd.wav"
-    wavfile.write(sFile,SAMPLE_RATE,audioChunk)
-    with WavReader(sFile) as reader:
-        with WavWriter(eFile, reader.channels, reader.samplerate) as writer:
-            tsm = phasevocoder(reader.channels, speed=NEW_SPEED[int(chunk[2])])
-            tsm.run(reader, writer)
-    _, alteredAudioData = wavfile.read(eFile)
+    if NEW_SPEED[int(chunk[2])] != 1:
+        sFile = TEMP_FOLDER+"/tempStart.wav"
+        eFile = TEMP_FOLDER+"/tempEnd.wav"
+        wavfile.write(sFile,SAMPLE_RATE,audioChunk)
+        with WavReader(sFile) as reader:
+            with WavWriter(eFile, reader.channels, reader.samplerate) as writer:
+                tsm = phasevocoder(reader.channels, speed=NEW_SPEED[int(chunk[2])])
+                tsm.run(reader, writer)
+        _, alteredAudioData = wavfile.read(eFile)
+    
+    else:
+        alteredAudioData = audioChunk
+    
+    alteredAudioData = alteredAudioData.copy()  # need to do this to make the ndarray writeable
+    
     leng = alteredAudioData.shape[0]
     endPointer = outputPointer+leng
-    outputAudioData = np.concatenate((outputAudioData,alteredAudioData/maxAudioVolume))
-
-    #outputAudioData[outputPointer:endPointer] = alteredAudioData/maxAudioVolume
 
     # smooth out transitiion's audio by quickly fading in/out
     
     if leng < AUDIO_FADE_ENVELOPE_SIZE:
-        outputAudioData[outputPointer:endPointer] = 0 # audio is less than 0.01 sec, let's just remove it.
+        alteredAudioData = np.zeros(alteredAudioData.shape) # audio is less than 0.01 sec, let's just remove it.
     else:
         premask = np.arange(AUDIO_FADE_ENVELOPE_SIZE)/AUDIO_FADE_ENVELOPE_SIZE
         mask = np.repeat(premask[:, np.newaxis],2,axis=1) # make the fade-envelope mask stereo
-        outputAudioData[outputPointer:outputPointer+AUDIO_FADE_ENVELOPE_SIZE] *= mask
-        outputAudioData[endPointer-AUDIO_FADE_ENVELOPE_SIZE:endPointer] *= 1-mask
+        alteredAudioData[:AUDIO_FADE_ENVELOPE_SIZE] = alteredAudioData[:AUDIO_FADE_ENVELOPE_SIZE] * mask
+        alteredAudioData[-AUDIO_FADE_ENVELOPE_SIZE:] = alteredAudioData[-AUDIO_FADE_ENVELOPE_SIZE:] * (1 - mask)
+    
+    audio_chunks.append(alteredAudioData / maxAudioVolume)
 
     startOutputFrame = int(math.ceil(outputPointer/samplesPerFrame))
     endOutputFrame = int(math.ceil(endPointer/samplesPerFrame))
@@ -188,8 +202,14 @@ for chunk in chunks:
             copyFrame(lastExistingFrame,outputFrame)
 
     outputPointer = endPointer
+    
+    if i % math.ceil(len(chunks) / 100) == 0:
+        now = datetime.datetime.now()
+        print(f'{int(i / len(chunks) * 100): 2}% {int((now - timestamp).total_seconds())} secs {endPointer - last_sample} samples {int((endPointer - last_sample) / (now - timestamp).total_seconds())} samples/sec')
+        timestamp = now
+        last_sample = endPointer
 
-wavfile.write(TEMP_FOLDER+"/audioNew.wav",SAMPLE_RATE,outputAudioData)
+wavfile.write(TEMP_FOLDER+"/audioNew.wav",SAMPLE_RATE, np.concatenate(audio_chunks))
 
 '''
 outputFrame = math.ceil(outputPointer/samplesPerFrame)
@@ -197,8 +217,10 @@ for endGap in range(outputFrame,audioFrameCount):
     copyFrame(int(audioSampleCount/samplesPerFrame)-1,endGap)
 '''
 
-command = "ffmpeg -framerate "+str(frameRate)+" -i "+TEMP_FOLDER+"/newFrame%06d.jpg -i "+TEMP_FOLDER+"/audioNew.wav -strict -2 "+OUTPUT_FILE
+command = "ffmpeg -framerate "+str(frameRate)+" -i "+TEMP_FOLDER+"/newFrame%06d.jpg -i "+TEMP_FOLDER+"/audioNew.wav -strict -2 \""+OUTPUT_FILE + "\" -hide_banner"
+print('command: ' + command)
 subprocess.call(command, shell=True)
 
+print('deleting temp directory')
 deletePath(TEMP_FOLDER)
 

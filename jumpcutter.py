@@ -1,3 +1,4 @@
+import io
 from contextlib import closing
 from PIL import Image
 import subprocess
@@ -11,7 +12,6 @@ from shutil import copyfile, rmtree
 import os
 import argparse
 from pytube import YouTube
-import datetime
 
 def downloadFile(url):
     callback = lambda stream, chunk, bytes_remaining: print(f'\rDownloading video: {round((1 - bytes_remaining / stream.filesize) * 100)}%', end='')
@@ -155,21 +155,21 @@ outputPointer = 0
 
 print('copying frames')
 lastExistingFrame = None
-timestamp = datetime.datetime.now()
-last_sample = 0
 audio_chunks = []
 for i, chunk in enumerate(chunks):
     audioChunk = audioData[int(chunk[0]*samplesPerFrame):int(chunk[1]*samplesPerFrame)]
-    
-    if NEW_SPEED[int(chunk[2])] != 1:
-        sFile = TEMP_FOLDER+"/tempStart.wav"
-        eFile = TEMP_FOLDER+"/tempEnd.wav"
-        wavfile.write(sFile,SAMPLE_RATE,audioChunk)
-        with WavReader(sFile) as reader:
-            with WavWriter(eFile, reader.channels, reader.samplerate) as writer:
-                tsm = phasevocoder(reader.channels, speed=NEW_SPEED[int(chunk[2])])
-                tsm.run(reader, writer)
-        _, alteredAudioData = wavfile.read(eFile)
+
+    if NEW_SPEED[int(chunk[2])] != 1:  # don't bother with transcoding the audio if we're not changing speed
+        with io.BytesIO() as eFile:
+            with io.BytesIO() as sFile:
+                wavfile.write(sFile,SAMPLE_RATE,audioChunk)
+                with WavReader(sFile) as reader:
+                    with WavWriter(eFile, reader.channels, reader.samplerate) as writer:
+                        tsm = phasevocoder(reader.channels, speed=NEW_SPEED[int(chunk[2])])
+                        tsm.run(reader, writer)
+
+            eFile.seek(0)
+            _, alteredAudioData = wavfile.read(eFile)
     
     else:
         alteredAudioData = audioChunk
@@ -204,10 +204,7 @@ for i, chunk in enumerate(chunks):
     outputPointer = endPointer
     
     if i % math.ceil(len(chunks) / 100) == 0:
-        now = datetime.datetime.now()
-        print(f'{int(i / len(chunks) * 100): 2}% {int((now - timestamp).total_seconds())} secs {endPointer - last_sample} samples {int((endPointer - last_sample) / (now - timestamp).total_seconds())} samples/sec')
-        timestamp = now
-        last_sample = endPointer
+        print(f'\r{int(i / len(chunks) * 100): 2}%', end='')
 
 wavfile.write(TEMP_FOLDER+"/audioNew.wav",SAMPLE_RATE, np.concatenate(audio_chunks))
 

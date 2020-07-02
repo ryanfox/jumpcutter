@@ -117,11 +117,9 @@ maxAudioVolume = getMaxVolume(audioData)
 f = open(TEMP_FOLDER+"/params.txt", 'r+')
 pre_params = f.read()
 f.close()
-params = pre_params.split('\n')
-for line in params:
-    m = re.search('Stream #.*Video.* ([0-9]*) fps',line)
-    if m is not None:
-        frameRate = float(m.group(1))
+m = re.search('Stream #.*Video.* ([0-9]*(\.\d*)?) fps', pre_params)
+if m is not None:
+    frameRate = float(m.group(1))
 
 samplesPerFrame = sampleRate/frameRate
 
